@@ -1,0 +1,4 @@
+dotenv
+fyers_apiv3
+pandas
+openpyxl
