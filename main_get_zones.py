@@ -1,9 +1,20 @@
 """
-main.py
--------
+main_get_zones.py
+-----------------
 Step 1 – enrich raw CSVs with technical indicators
-Step 2 – scan enriched CSVs for the NR-Inside-Expansion pattern
+Step 2 – scan enriched CSVs for Supply/Demand zones (GEL pattern)
 Step 3 – save a consolidated report (CSV + Excel)
+
+Zone Logic (from notes):
+  C1 = Leg-In  candle → TR > ATR  (filled candle)
+  C2 = UOC     candle → TR < ATR  (boring candle, dual-side wicks)
+  C3 = Leg-Out candle → TR > ATR  (filled candle, strong move)
+
+  zone_high = max(C2.open, C2.close)
+  zone_low  = min(C2.open, C2.close)
+
+  Supply Zone → C3 leg-out is DOWN  (price returns to zone to SELL)
+  Demand Zone → C3 leg-out is UP    (price returns to zone to BUY)
 """
 
 import logging
@@ -36,7 +47,9 @@ BB_PERIOD  = 20
 BB_STD     = 2.0
 
 # Pattern parameters
-BODY_MULTIPLIER = 1.2               # C1 > 2×C2  and  C3 > 2×C1
+# C1 body must be > BODY_MULTIPLIER × C2 body
+# C3 body must be > BODY_MULTIPLIER × C2 body
+BODY_MULTIPLIER = 3
 ATR_COLUMN      = f"atr_{ATR_PERIOD}"
 
 # Report output formats  (set False to skip)
@@ -66,9 +79,9 @@ def main() -> None:
         bb_std        = BB_STD,
     )
 
-    # ── Step 2: scan patterns ─────────────────────────────────────────────────
+    # ── Step 2: scan zones ────────────────────────────────────────────────────
     print("\n" + "═" * 60)
-    print("  STEP 2  –  Scanning for NR-Inside-Expansion patterns")
+    print("  STEP 2  –  Scanning for Supply / Demand Zones (GEL pattern)")
     print("═" * 60)
 
     report = scan_patterns(
@@ -77,13 +90,11 @@ def main() -> None:
         body_multiplier = BODY_MULTIPLIER,
     )
 
-    # ✅ FIX: handle empty or missing columns
     if report.empty:
-        print("No patterns found – skipping sorting.")
+        print("No zones found – skipping sorting.")
     else:
         required_cols = ["strength", "score", "c3_datetime"]
-
-        missing_cols = [col for col in required_cols if col not in report.columns]
+        missing_cols  = [col for col in required_cols if col not in report.columns]
 
         if missing_cols:
             print(f"Warning: Missing columns {missing_cols} – skipping sort.")
@@ -92,6 +103,7 @@ def main() -> None:
                 required_cols,
                 ascending=[False, False, True]
             )
+
     # ── Step 3: save report ───────────────────────────────────────────────────
     print("\n" + "═" * 60)
     print("  STEP 3  –  Saving report")
@@ -101,18 +113,18 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     if report.empty:
-        print("  No patterns found – report not written.")
+        print("  No zones found – report not written.")
         return
 
     if SAVE_CSV:
-        csv_path = report_dir / "pattern_report.csv"
+        csv_path = report_dir / "zone_report.csv"
         report.to_csv(csv_path, index=False)
         print(f"  CSV   saved → {csv_path}  ({len(report)} rows)")
 
     if SAVE_EXCEL:
         try:
             import openpyxl                          # noqa: F401
-            xl_path = report_dir / "pattern_report.xlsx"
+            xl_path = report_dir / "zone_report.xlsx"
             _save_excel(report, xl_path)
             print(f"  Excel saved → {xl_path}")
         except ImportError:
@@ -121,9 +133,14 @@ def main() -> None:
 
     # ── print summary ─────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
-    print(f"  Total patterns  : {len(report)}")
-    for ptype, n in report["pattern_type"].value_counts().items():
+    print(f"  Total zones found : {len(report)}")
+    for ptype, n in report["pattern_label"].value_counts().items():
         print(f"    {ptype:<30} {n}")
+    print("\n  Zone columns in report:")
+    print("    zone_high  = max(C2.open, C2.close)  ← ZONE TOP")
+    print("    zone_low   = min(C2.open, C2.close)  ← ZONE BOTTOM")
+    print("    zone_type  = Supply | Demand")
+    print("    sub_type   = DBD | RBD | DBR | RBR")
     print("─" * 60)
 
 
@@ -137,8 +154,10 @@ def _save_excel(report, path: Path) -> None:
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    GREEN_FILL  = PatternFill("solid", fgColor="CCFFCC")   # breakout_up
-    RED_FILL    = PatternFill("solid", fgColor="FFCCCC")   # breakout_down
+    # Demand zone = green (price returns to BUY)
+    # Supply zone = red   (price returns to SELL)
+    GREEN_FILL = PatternFill("solid", fgColor="CCFFCC")
+    RED_FILL   = PatternFill("solid", fgColor="FFCCCC")
     HDR_FILL   = PatternFill("solid", fgColor="1F3864")
     HDR_FONT   = Font(bold=True, color="FFFFFF", size=10)
     BODY_FONT  = Font(size=10)
@@ -149,30 +168,39 @@ def _save_excel(report, path: Path) -> None:
     ws_sum = wb.active
     ws_sum.title = "Summary"
 
-    counts = report["pattern_type"].value_counts()
+    counts = report["pattern_label"].value_counts()
     rows = [
-        ["NR-Inside-Expansion Pattern Report"],
+        ["Supply / Demand Zone Report  (GEL Pattern)"],
         [],
-        ["Total patterns found",     len(report)],
+        ["Total zones found",     len(report)],
     ]
     for pt, n in counts.items():
         rows.append([f"  {pt}", n])
     rows += [
         [],
-        ["Symbols with matches",   report["symbol"].nunique()],
-        ["Files scanned",          report["source_file"].nunique()],
+        ["Symbols with zones",    report["symbol"].nunique()],
+        ["Files scanned",         report["source_file"].nunique()],
         [],
-        ["── Pattern Logic ──"],
-        ["Condition 1",  "C1 TR > ATR  |  C2 TR < ATR  |  C3 TR > ATR"],
-        ["Condition 2",  f"C1 body > {BODY_MULTIPLIER}× C2 body  AND  "
-                         f"C3 body > {BODY_MULTIPLIER}× C1 body"],
-        ["Condition 3",  "C3 body must clear C2 body entirely (no overlap)"],
-        ["  breakout_up",   "C3 open > C2 top  AND  C3 close > C2 top"],
-        ["  breakout_down", "C3 open < C2 bot  AND  C3 close < C2 bot"],
+        ["── Zone Logic ──"],
+        ["C1  Leg-In  candle", "TR > ATR  (filled candle)"],
+        ["C2  UOC     candle", "TR < ATR  (boring, dual-side wicks)  ← ZONE CANDLE"],
+        ["C3  Leg-Out candle", "TR > ATR  (filled candle, strong move)"],
+        [],
+        ["zone_high", "max(C2.open, C2.close)  ← zone top"],
+        ["zone_low",  "min(C2.open, C2.close)  ← zone bottom"],
+        [],
+        ["Supply Zone", "C3 leg-out is DOWN  → return to zone to SELL"],
+        ["Demand Zone", "C3 leg-out is UP    → return to zone to BUY"],
+        [],
+        ["Sub-types"],
+        ["DBD", "Drop-Base-Drop  (Supply)"],
+        ["RBD", "Rally-Base-Drop (Supply)"],
+        ["DBR", "Drop-Base-Rally (Demand)"],
+        ["RBR", "Rally-Base-Rally (Demand)"],
         [],
         ["Row colour key"],
-        ["Green row", "breakout_up   (C3 body entirely above C2 body)"],
-        ["Red   row", "breakout_down (C3 body entirely below C2 body)"],
+        ["Green row", "Demand Zone  (return to BUY)"],
+        ["Red   row", "Supply Zone  (return to SELL)"],
     ]
     for row in rows:
         ws_sum.append(row)
@@ -191,8 +219,8 @@ def _save_excel(report, path: Path) -> None:
             cell.alignment = Alignment(horizontal="center")
 
         _FILL_MAP = {
-            "breakout_up":   GREEN_FILL,
-            "breakout_down": RED_FILL,
+            "breakout_up":   GREEN_FILL,   # Demand zone
+            "breakout_down": RED_FILL,     # Supply zone
         }
 
         pt_col = headers.index("pattern_type") + 1
@@ -222,7 +250,7 @@ def _save_excel(report, path: Path) -> None:
 
         ws.freeze_panes = "A2"
 
-    ws_all = wb.create_sheet("All Patterns")
+    ws_all = wb.create_sheet("All Zones")
     _write_sheet(ws_all, report)
 
     # ── Per-symbol sheets ─────────────────────────────────────────────────────

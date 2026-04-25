@@ -2,86 +2,46 @@
 pattern_detector.py
 --------------------
 Scans enriched CSV files (output of technical_indicators.py) for
-candlestick patterns and produces a consolidated DataFrame report.
+Supply / Demand zone patterns and produces a consolidated DataFrame report.
 
-Pattern: "NR-Inside-Expansion" (3-candle squeeze-and-expand)
+Pattern: "NR-Inside-Expansion" (GEL – 3-candle structure)
 ═══════════════════════════════════════════════════════════════
-Fires when THREE consecutive candles satisfy ALL conditions below.
 
-  Condition 1 – Volatility shape (contraction then expansion)
-  ─────────────────────────────────────────────────────────────
-      C1 : true_range > atr_14   → large / above-average candle
-      C2 : true_range < atr_14   → tight / inside / NR candle
-      C3 : true_range > atr_14   → large / above-average candle again
+  C1  =  Leg-In candle    → TR > ATR  (filled / large candle)
+  C2  =  UOC candle       → TR < ATR  (boring / tight candle, dual-side wicks)
+  C3  =  Leg-Out candle   → TR > ATR  (filled / large candle, strong move)
 
-      ATR is read from C3's row (the most current value at signal time).
+  ZONE is drawn from C2 body:
+      zone_high = max(C2.open, C2.close)
+      zone_low  = min(C2.open, C2.close)
 
-  Condition 2 – Body-size cascade
-  ─────────────────────────────────────────────────────────────
-      body(C1) > multiplier × body(C2)   (C1 at least 2× bigger than C2)
-      body(C3) > multiplier × body(C1)   (C3 at least 2× bigger than C1)
+  Pattern types
+  ─────────────
+  Supply Zone (DBD / RBD)  →  C3 is a bearish leg-out (breakout_down)
+      zone = C2 body → price will RETURN to this zone to SELL
 
-      body = abs(close - open) for each candle.
-      Zero-body doji candles for C2 are skipped (division guard).
+  Demand Zone (DBR / RBR)  →  C3 is a bullish leg-out (breakout_up)
+      zone = C2 body → price will RETURN to this zone to BUY
 
-  Condition 3 – C3 body clears C2 body completely (no shadow-over)
-  ─────────────────────────────────────────────────────────────────
-      Define C2 body zone:
-          c2_top = max(C2.open, C2.close)
-          c2_bot = min(C2.open, C2.close)
-
-      C3 must satisfy ONE of:
-          BREAKOUT UP   : C3.open > c2_top  AND  C3.close > c2_top
-          BREAKOUT DOWN : C3.open < c2_bot  AND  C3.close < c2_bot
-
-      Any overlap (C3 body straddling or inside C2 body) is rejected.
-
-      Example (from spec):
-          C2 open=100, C2 close=103  →  c2_bot=100, c2_top=103
-          Valid UP   : C3 open=104, close=107  (both > 103) ✓
-          Valid DOWN : C3 open=99,  close=96   (both < 100) ✓
-          Rejected   : C3 open=101, close=108  (open inside zone) ✗
-
-Pattern types
-─────────────
-  breakout_up    C3 body sits entirely above C2 body
-  breakout_down  C3 body sits entirely below C2 body
+  Additional rules per notes:
+  - C2 (UOC) must have BOTH upper and lower wicks (dual-side wick)
+  - C2 body must be significantly smaller than C1 body
+  - C3 body must be significantly larger than C2 body (strong leg-out)
+  - C3 must clear C2 body completely (no overlap)
+  - Space (gap) between C2 and C3 is good (not required but scored)
+  - NO gap should exist between C1 and C2 (they should be adjacent)
 
 Output columns
 ──────────────
-  symbol           ticker / symbol value from the source CSV
-  pattern_type     "breakout_up" | "breakout_down"
-  c1_datetime      datetime of candle 1
-  c2_datetime      datetime of candle 2
-  c3_datetime      datetime of candle 3  (signal / trigger candle)
-  c1_open          open  price of C1
-  c1_close         close price of C1
-  c1_body          abs(C1.close - C1.open)
-  c1_tr            true range of C1
-  c2_open          open  price of C2
-  c2_close         close price of C2
-  c2_body          abs(C2.close - C2.open)
-  c2_tr            true range of C2
-  c2_top           max(C2.open, C2.close)  – upper body edge
-  c2_bot           min(C2.open, C2.close)  – lower body edge
-  c3_open          open  price of C3
-  c3_close         close price of C3
-  c3_body          abs(C3.close - C3.open)
-  c3_tr            true range of C3
-  atr_at_signal    ATR value on C3's row
-  b1_vs_b2_x       body(C1) / body(C2)  – size ratio for C1 over C2
-  b3_vs_b1_x       body(C3) / body(C1)  – size ratio for C3 over C1
-  source_file      filename the match came from
-
-Usage (from main.py)
-────────────────────
-    from pattern_detector import scan_patterns
-
-    report_df = scan_patterns(
-        enriched_folder = "data/enriched",
-        atr_col         = "atr_14",   # must match the column in your CSVs
-        body_multiplier = 2.0,        # threshold for Condition 2
-    )
+  symbol, pattern_type, strength, score
+  c1_datetime, c2_datetime, c3_datetime
+  c1_open, c1_close, c1_body, c1_tr
+  c2_open, c2_close, c2_body, c2_tr
+  c3_open, c3_close, c3_body, c3_tr
+  zone_high  ← max(C2.open, C2.close)  ← THE ZONE TOP
+  zone_low   ← min(C2.open, C2.close)  ← THE ZONE BOTTOM
+  atr_at_signal, b1_vs_b2_x, b3_vs_b2_x
+  source_file
 """
 
 from __future__ import annotations
@@ -103,12 +63,12 @@ def _classify_c3_vs_c2(
     c3_open: float, c3_close: float,
 ) -> str | None:
     """
-    Condition 3 check.
+    Condition 3 check – C3 body must fully clear C2 body.
 
     Returns
     -------
-    "breakout_up"   – C3 body entirely above C2 body
-    "breakout_down" – C3 body entirely below C2 body
+    "breakout_up"   – C3 body entirely above C2 body  → Demand Zone
+    "breakout_down" – C3 body entirely below C2 body  → Supply Zone
     None            – C3 body overlaps C2 body (pattern rejected)
     """
     c2_top = max(c2_open, c2_close)
@@ -117,11 +77,11 @@ def _classify_c3_vs_c2(
     c3_body_top = max(c3_open, c3_close)
     c3_body_bot = min(c3_open, c3_close)
 
-    if c3_body_bot > c2_top:        # entire C3 body is above C2 body
+    if c3_close > c2_top:
         return "breakout_up"
-    if c3_body_top < c2_bot:        # entire C3 body is below C2 body
+    if c3_close < c2_bot:
         return "breakout_down"
-    return None                     # overlap – reject
+    return None                      # overlap – reject
 
 
 def _dt(row: pd.Series) -> str:
@@ -139,6 +99,7 @@ def _scan_file(
     source_name: str,
     atr_col: str,
     body_multiplier: float,
+    body_multiplier_second: float,
 ) -> list[dict]:
 
     required = {"open", "high", "low", "close", "true_range", atr_col, "candle_body"}
@@ -150,178 +111,303 @@ def _scan_file(
     df = df.reset_index(drop=True)
     records = []
 
-    LOOKBACK = 20   # for white space
-    STRONG_TR_MULTIPLIER = 1.2
+    # Skip until we have enough rows for ATR to be valid
+    LOOKBACK = 20
 
-    for i in range(len(df) - 2):
-
-        if i < LOOKBACK:
-            continue
+    for i in range(LOOKBACK, len(df) - 2):
 
         c1 = df.iloc[i]
         c2 = df.iloc[i + 1]
         c3 = df.iloc[i + 2]
+        # c4 = df.iloc[i + 3]
+        # c5 = df.iloc[i + 4]
+        # c6 = df.iloc[i + 5]
 
-        # ─────────────────────────────────────────────
-        # ATR per candle (FIXED)
-        # ─────────────────────────────────────────────
+
         atr1 = float(c1[atr_col])
         atr2 = float(c2[atr_col])
         atr3 = float(c3[atr_col])
-
+        # atr4 = float(c4[atr_col])
+        # atr5 = float(c5[atr_col])
+        # atr6 = float(c6[atr_col])
+        # leg_in = []
+        # boring = []
+        # leg_out =[]
         if pd.isna(atr1) or pd.isna(atr2) or pd.isna(atr3):
             continue
 
-        # ─────────────────────────────────────────────
-        # Condition 1 – Volatility Shape (Improved)
-        # ─────────────────────────────────────────────
-        if not (
-            c1["true_range"] > atr1 and
-            c2["true_range"] < atr2 and
-            c3["true_range"] > 1.2 * atr3
-        ):
+        # ─────────────────────────────────────────────────────
+        # CONDITION 1 – TR vs ATR
+        #   C1: Leg-In  → TR > ATR  (filled candle)
+        #   C2: UOC     → TR < ATR  (boring / tight candle)
+        #   C3: Leg-Out → TR > ATR  (filled candle)
+        # ─────────────────────────────────────────────────────
+        c1_tr = float(c1["true_range"])
+        c2_tr = float(c2["true_range"])
+        c3_tr = float(c3["true_range"])
+        # c4_tr = float(c4["true_range"])
+        # c5_tr = float(c5["true_range"])
+        # c6_tr = float(c6["true_range"])
+
+        # #Leg in is C1
+        # if not (c1_tr > atr1):
+        #     continue
+        # leg_in = [c1]
+        # # Boring candle
+        # if not c2_tr <  atr2:
+        #     continue
+        # elif not c3_tr < atr3:
+        #     boring = [c2]
+        #     leg_out = [c3]
+        # elif not c4_tr < atr4:
+        #     continue
+        # else:
+        #     boring = [c2,c3]
+        #     leg_out = [c4]
+
+        # #legout
+        # if leg_out contains c3 and c4 starts from where c3 ends in same direction
+        # then leg_out =[c3,c4]
+        # else leg_out = c3 only 
+
+        # if leg_out contains c4 and c5 starts from where c4 ends in same direction
+        # then leg_out =[c4,c5]
+        # else leg_out = c4 only
+
+
+    
+
+        # check if c2 c3 are boring candle or only c2
+
+        #cehck if c3 c4 c5 c6 are Legout
+        # More realistic thresholds
+        if not (c1_tr > atr1 and c2_tr <  atr2 and c3_tr > atr3):
+
             continue
 
-        # Strong breakout filter (NEW)
-        if c3["true_range"] < STRONG_TR_MULTIPLIER * atr3:
+        # ─────────────────────────────────────────────────────
+        # CONDITION 2 – UOC must have BOTH wicks (dual-side wick)
+        #   Upper wick: high - max(open, close)  > 0
+        #   Lower wick: min(open, close) - low   > 0
+        # ─────────────────────────────────────────────────────
+        upper_wick_c2 = float(c2["high"]) - max(float(c2["open"]), float(c2["close"]))
+        lower_wick_c2 = min(float(c2["open"]), float(c2["close"])) - float(c2["low"])
+
+        # Require meaningful dual wicks (not zero, not noise)
+        if upper_wick_c2 < 0.05 * c2_tr or lower_wick_c2 < 0.05 * c2_tr:
             continue
-        # WHITE AREA (C2 must be clean)
-        upper_shadow = c2["high"] - max(c2["open"], c2["close"])
-        lower_shadow = min(c2["open"], c2["close"]) - c2["low"]
 
-        body = c2["candle_body"]
-
-        if body == 0:
-            shadow_ratio = 0   # or np.nan
-        else:
-            shadow_ratio = (upper_shadow + lower_shadow) / body
-
-        if shadow_ratio > 0.5:
-            continue
-        # ─────────────────────────────────────────────
-        # Condition 2 – Body Cascade
-        # ─────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────
+        # CONDITION 3 – BODY SIZE CHECK
+        #   b1 (Leg-In body) must be larger than b2 (UOC body)
+        #   b3 (Leg-Out body) must be larger than b2 (UOC body)
+        #   Both must be at least body_multiplier times bigger
+        # ─────────────────────────────────────────────────────
         b1 = float(c1["candle_body"])
         b2 = float(c2["candle_body"])
         b3 = float(c3["candle_body"])
 
+        # Skip doji C2 (zero body) to avoid divide-by-zero
         if b2 == 0:
             continue
 
-        if not (b1 > body_multiplier * b2 and b3 > body_multiplier * b1):
+        # C1 (leg-in) must be bigger than C2 (UOC)
+        if b1 <= body_multiplier * b2:
             continue
 
-        # ─────────────────────────────────────────────
-        # Condition 3 – Clean Breakout
-        # ─────────────────────────────────────────────
+        # C3 (leg-out) must be bigger than C1 Leg in
+        if b3 <= body_multiplier_second * b1:
+            continue
+
+        # ─────────────────────────────────────────────────────
+        # CONDITION 4 – C3 body must fully clear C2 body
+        #   breakout_up   → Demand Zone (price will return to buy)
+        #   breakout_down → Supply Zone (price will return to sell)
+        # ─────────────────────────────────────────────────────
         ptype = _classify_c3_vs_c2(
-            c2_open  = float(c2["open"]),
-            c2_close = float(c2["close"]),
-            c3_open  = float(c3["open"]),
-            c3_close = float(c3["close"]),
+            float(c2["open"]), float(c2["close"]),
+            float(c3["open"]), float(c3["close"])
         )
 
         if ptype is None:
             continue
+        # ─────────────────────────────────────────────────────
+        # CONDITION 5 – GAP BETWEEN C2 AND C3 (IMPORTANT)
+        # ─────────────────────────────────────────────────────
 
-        # ─────────────────────────────────────────────
-        # Direction Confirmation (NEW)
-        # ─────────────────────────────────────────────
-        c1_bull = c1["close"] > c1["open"]
-        c3_bull = c3["close"] > c3["open"]
+        c2_top = max(float(c2["open"]), float(c2["close"]))
+        c2_bot = min(float(c2["open"]), float(c2["close"]))
 
-        if ptype == "breakout_up" and not (c1_bull and c3_bull):
-            continue
-
-        if ptype == "breakout_down" and not ((not c1_bull) and (not c3_bull)):
-            continue
-
-        # ─────────────────────────────────────────────
-        # WHITE SPACE (CRITICAL EDGE)
-        # ─────────────────────────────────────────────
-        recent_data = df.iloc[i-LOOKBACK:i]
-
-        recent_high = recent_data["high"].max()
-        recent_low  = recent_data["low"].min()
-
-        white_space_score = 0
+        c3_high = float(c3["high"])
+        c3_low  = float(c3["low"])
 
         if ptype == "breakout_up":
-            if c3["close"] <= recent_high:
-                continue
-            white_space_score = (c3["close"] - recent_high) / atr3
+            gap = c3_low - c2_top
+        else:
+            gap = c2_bot - c3_high
 
-        if ptype == "breakout_down":
-            if c3["close"] >= recent_low:
-                continue
-            white_space_score = (recent_low - c3["close"]) / atr3
+        # normalize
+        gap = max(0.0, gap)
 
-        if white_space_score < 0.5:
+        # minimum gap threshold (VERY IMPORTANT)
+        MIN_GAP = 0.1 * atr3   # you can tune this
+
+        if gap < MIN_GAP:
             continue
 
-        # ─────────────────────────────────────────────
-        # SCORING SYSTEM (NEW - VERY POWERFUL)
-        # ─────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────
+        # CONDITION 6 – Match candle direction with breakout type
+        # ─────────────────────────────────────────────────────
+
+        c3_open  = float(c3["open"])
+        c3_close = float(c3["close"])
+
+        # Reject doji
+        if c3_close == c3_open:
+            continue
+
+        if ptype == "breakout_up" and c3_close <= c3_open:
+            continue  # breakout up must be bullish
+
+        if ptype == "breakout_down" and c3_close >= c3_open:
+            continue  # breakout down must be bearish
+        # ─────────────────────────────────────────────────────
+        # ZONE DEFINITION
+        #   The zone IS the C2 (UOC / Boring Candle) body.
+        #   zone_high = max(C2.open, C2.close)
+        #   zone_low  = min(C2.open, C2.close)
+        #
+        #   For Supply Zone: zone is where price returns to SELL
+        #   For Demand Zone: zone is where price returns to BUY
+        # ─────────────────────────────────────────────────────
+        zone_high = max(float(c2["open"]), float(c2["close"]))
+        zone_low  = min(float(c2["open"]), float(c2["close"]))
+
+        # ─────────────────────────────────────────────────────
+        # OPTIONAL: Check no gap between C1 and C2
+        #   (Leg-In and UOC should be adjacent – no space)
+        #   gap_c1_c2 = 0 ideally; allow small tolerance
+        # ─────────────────────────────────────────────────────
+        # c1_top = max(float(c1["open"]), float(c1["close"]))
+        # c1_bot = min(float(c1["open"]), float(c1["close"]))
+        # gap_c1_c2 = abs(float(c2["open"]) - float(c1["close"]))
+        # has_c1_c2_gap = gap_c1_c2 > 0.2 * atr1
+
+        # ─────────────────────────────────────────────────────
+        # OPTIONAL: Check space (gap) between C2 and C3 bodies
+        #   "Space between Boring Candle and Leg-Out is good"
+        # ─────────────────────────────────────────────────────
+        if ptype == "breakout_up":
+            gap_c2_c3 = float(c3["low"]) - zone_high
+        else:
+            gap_c2_c3 = zone_low - float(c3["high"])
+
+        gap_c2_c3 = max(0.0, gap_c2_c3)
+
+        has_c2_c3_space = gap_c2_c3 > 0
+
+        # ─────────────────────────────────────────────────────
+        # SCORING
+        # ─────────────────────────────────────────────────────
         score = 0
 
-        # strong breakout
-        if c3["true_range"] > 1.5 * atr3:
+        # Strong leg-out
+        if c3_tr > 1.5 * atr3:
             score += 2
         else:
             score += 1
 
-        # body strength
-        if b3 > 2.5 * b1:
+        # Large body ratio C3 vs C2
+        if b3 > 1.5 * b1:
             score += 2
         else:
             score += 1
 
-        # white space strength
-        if white_space_score > 1:
-            score += 2
-        else:
+        # # Space between C2 and C3 (good sign per notes)
+        # if has_c2_c3_space:
+        #     score += 1
+
+        # # No gap between C1 and C2 (ideal)
+        # if not has_c1_c2_gap:
+        #     score += 1
+
+        # Large C1 vs C2 ratio
+        if b1 > 2.0 * b2:
             score += 1
 
         strength = "weak"
-        if score >= 5:
+        if score >= 6:
             strength = "strong"
         elif score >= 4:
             strength = "moderate"
 
-        # ─────────────────────────────────────────────
-        # RECORDco
-        # ─────────────────────────────────────────────
-        c2_top = max(float(c2["open"]), float(c2["close"]))
-        c2_bot = min(float(c2["open"]), float(c2["close"]))
+        # ─────────────────────────────────────────────────────
+        # DETERMINE ZONE PATTERN SUB-TYPE
+        #   Supply: DBD (Drop-Base-Drop) or RBD (Rally-Base-Drop)
+        #   Demand: DBR (Drop-Base-Rally) or RBR (Rally-Base-Rally)
+        # ─────────────────────────────────────────────────────
+        c1_is_bearish = float(c1["close"]) < float(c1["open"])
+        c1_is_bullish = float(c1["close"]) > float(c1["open"])
 
+        if ptype == "breakout_down":
+            zone_type = "Supply"
+            sub_type = "DBD" if c1_is_bearish else "RBD"
+        else:
+            zone_type = "Demand"
+            sub_type = "DBR" if c1_is_bearish else "RBR"
+
+        pattern_label = f"{zone_type}_{sub_type}"
+
+        # ─────────────────────────────────────────────────────
+        # RECORD
+        # ─────────────────────────────────────────────────────
         records.append({
-            "symbol": c1.get("symbol", source_name),
-            "pattern_type": ptype,
-            "strength": strength,
-            "score": score,
+            "symbol":        c1.get("symbol", source_name),
+            "pattern_type":  ptype,               # "breakout_up" or "breakout_down"
+            "zone_type":     zone_type,            # "Supply" or "Demand"
+            "sub_type":      sub_type,             # "DBD", "RBD", "DBR", "RBR"
+            "pattern_label": pattern_label,        # e.g. "Supply_DBD"
+            "strength":      strength,
+            "score":         score,
 
-            "c1_datetime": _dt(c1),
-            "c2_datetime": _dt(c2),
-            "c3_datetime": _dt(c3),
+            "c1_datetime":   _dt(c1),
+            "c2_datetime":   _dt(c2),
+            "c3_datetime":   _dt(c3),
 
-            "c1_body": round(b1, 2),
-            "c2_body": round(b2, 2),
-            "c3_body": round(b3, 2),
+            "c1_open":       round(float(c1["open"]),  4),
+            "c1_close":      round(float(c1["close"]), 4),
+            "c1_body":       round(b1, 4),
+            "c1_tr":         round(c1_tr, 4),
 
-            "c3_tr": round(float(c3["true_range"]), 2),
+            "c2_open":       round(float(c2["open"]),  4),
+            "c2_close":      round(float(c2["close"]), 4),
+            "c2_body":       round(b2, 4),
+            "c2_tr":         round(c2_tr, 4),
+            "c2_upper_wick": round(upper_wick_c2, 4),
+            "c2_lower_wick": round(lower_wick_c2, 4),
+
+            "c3_open":       round(float(c3["open"]),  4),
+            "c3_close":      round(float(c3["close"]), 4),
+            "c3_body":       round(b3, 4),
+            "c3_tr":         round(c3_tr, 4),
+
+            # ── THE ZONE (from C2 body) ─────────────────────
+            "zone_high":     round(zone_high, 4),   # max(C2.open, C2.close)
+            "zone_low":      round(zone_low,  4),   # min(C2.open, C2.close)
+            # ─────────────────────────────────────────────────
+
             "atr_at_signal": round(atr3, 4),
 
-            "white_space_score": round(white_space_score, 2),
+            "b1_vs_b2_x":    round(b1 / b2, 2),   # C1 body / C2 body
+            "b3_vs_b2_x":    round(b3 / b2, 2),   # C3 body / C2 body
 
-            "b1_vs_b2_x": round(b1 / b2, 2),
-            "b3_vs_b1_x": round(b3 / b1, 2),
+            "gap_c2_c3":     round(gap_c2_c3, 4), # space between UOC and Leg-Out
 
-            "source_file": source_name,
-            "zone_low": round(float(c2["low"]), 2),
-            "zone_high": round(float(c2["high"]), 2),
+            "source_file":   source_name,
         })
 
     return records
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Public entry point
@@ -330,24 +416,35 @@ def _scan_file(
 def scan_patterns(
     enriched_folder: str,
     atr_col:         str   = "atr_14",
-    body_multiplier: float = 2.0,
+    body_multiplier: float = 3,
+    body_multiplier_second: float = 1.3,
+    
     glob_pattern:    str   = "*.csv",
 ) -> pd.DataFrame:
     """
     Scan every enriched CSV in *enriched_folder* and return a consolidated
-    DataFrame of all pattern occurrences.
+    DataFrame of all Supply/Demand zone occurrences.
 
     Parameters
     ----------
     enriched_folder  : folder produced by technical_indicators.add_indicators_to_folder
     atr_col          : ATR column name to use (default "atr_14")
-    body_multiplier  : size-cascade multiplier for Condition 2 (default 2.0)
+    body_multiplier  : size multiplier for body cascade check (default 2.0)
+                       C1 body > multiplier × C2 body
+                       C3 body > multiplier × C2 body
     glob_pattern     : file filter inside the folder (default "*.csv")
 
     Returns
     -------
-    pd.DataFrame  – one row per pattern hit, sorted by c3_datetime.
+    pd.DataFrame  – one row per pattern hit.
                     Empty DataFrame if no patterns are found.
+
+    Zone columns in output
+    ----------------------
+    zone_high  : max(C2.open, C2.close)  ← SELL/BUY zone top
+    zone_low   : min(C2.open, C2.close)  ← SELL/BUY zone bottom
+    zone_type  : "Supply" or "Demand"
+    sub_type   : "DBD" | "RBD" | "DBR" | "RBR"
     """
     folder = Path(enriched_folder)
     files  = sorted(folder.glob(glob_pattern))
@@ -356,7 +453,7 @@ def scan_patterns(
         log.warning("No files matched '%s' in '%s'", glob_pattern, enriched_folder)
         return pd.DataFrame()
 
-    log.info("Scanning %d enriched file(s) for patterns …", len(files))
+    log.info("Scanning %d enriched file(s) for Supply/Demand zones …", len(files))
 
     all_records: list[dict] = []
 
@@ -369,12 +466,12 @@ def scan_patterns(
                 df["datetime_ist"] = pd.to_datetime(df["datetime_ist"])
                 df = df.sort_values("datetime_ist").reset_index(drop=True)
 
-            hits = _scan_file(df, f.name, atr_col, body_multiplier)
+            hits = _scan_file(df, f.name, atr_col, body_multiplier, body_multiplier_second)
 
             if hits:
-                log.info("  %-30s  →  %d pattern(s) found", f.name, len(hits))
+                log.info("  %-30s  →  %d zone(s) found", f.name, len(hits))
             else:
-                log.info("  %-30s  →  no patterns", f.name)
+                log.info("  %-30s  →  no zones", f.name)
 
             all_records.extend(hits)
 
@@ -382,7 +479,7 @@ def scan_patterns(
             log.error("  Error reading '%s': %s", f.name, exc)
 
     if not all_records:
-        log.info("No patterns found across all files.")
+        log.info("No zones found across all files.")
         return pd.DataFrame()
 
     report = (
@@ -391,11 +488,11 @@ def scan_patterns(
         .reset_index(drop=True)
     )
 
-    n_up   = (report["pattern_type"] == "breakout_up").sum()
-    n_down = (report["pattern_type"] == "breakout_down").sum()
+    n_supply = (report["zone_type"] == "Supply").sum()
+    n_demand = (report["zone_type"] == "Demand").sum()
     log.info(
-        "Total patterns found: %d  (%d breakout_up  |  %d breakout_down)",
-        len(report), n_up, n_down,
+        "Total zones found: %d  (%d Supply  |  %d Demand)",
+        len(report), n_supply, n_demand,
     )
 
     return report
