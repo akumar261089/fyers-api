@@ -135,7 +135,6 @@ def _scan_file(
         # leg_out =[]
         if pd.isna(atr1) or pd.isna(atr2) or pd.isna(atr3):
             continue
-
         # ─────────────────────────────────────────────────────
         # CONDITION 1 – TR vs ATR
         #   C1: Leg-In  → TR > ATR  (filled candle)
@@ -184,6 +183,32 @@ def _scan_file(
         if not (c1_tr > atr1 and c2_tr <  atr2 and c3_tr > atr3):
 
             continue
+        # ─────────────────────────────────────────────────────
+        # CONDITION 0 – C1 should have small or no wicks
+        #   Strong leg-in = mostly body, very small wicks
+        # ─────────────────────────────────────────────────────
+
+        c1_open  = float(c1["open"])
+        c1_close = float(c1["close"])
+        c1_high  = float(c1["high"])
+        c1_low   = float(c1["low"])
+
+        c1_upper_wick = c1_high - max(c1_open, c1_close)
+        c1_lower_wick = min(c1_open, c1_close) - c1_low
+
+        # total wick vs TR
+        c1_total_wick = c1_upper_wick + c1_lower_wick
+
+        # Allow very small wick (tunable)
+        MAX_WICK_RATIO = 0.2   # 20% of TR (you can try 0.1–0.25)
+
+        # bullish leg-in → upper wick should be tiny
+        if c1_close > c1_open and c1_upper_wick > 0.2 * (c1_close-c1_open):
+            continue
+
+        # bearish leg-in → lower wick should be tiny
+        if c1_close < c1_open and c1_lower_wick > 0.2 *  (c1_open-c1_close):
+            continue
 
         # ─────────────────────────────────────────────────────
         # CONDITION 2 – UOC must have BOTH wicks (dual-side wick)
@@ -194,7 +219,7 @@ def _scan_file(
         lower_wick_c2 = min(float(c2["open"]), float(c2["close"])) - float(c2["low"])
 
         # Require meaningful dual wicks (not zero, not noise)
-        if upper_wick_c2 < 0.05 * c2_tr or lower_wick_c2 < 0.05 * c2_tr:
+        if upper_wick_c2 < 0.05 * c2_tr and lower_wick_c2 < 0.05 * c2_tr:
             continue
 
         # ─────────────────────────────────────────────────────
